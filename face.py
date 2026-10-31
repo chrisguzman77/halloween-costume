@@ -26,8 +26,6 @@ SOUND_VOLUME = 0.6      # 0.0 to 1.0
 PIXEL_GAP = 0.15        # gap between "LEDs" (0 = solid pixels, 0.3 = very dotty)
 FPS = 30
 FULLSCREEN = True
-ROTATE = 90             # 0, 90, 180 or 270. Use 90 or 270 to turn a portrait screen sideways
-                        # (if the face is upside down, switch 90 <-> 270)
 
 # GPIO (BCM numbers) -> emotion. Each pin sits right next to a GND pin.
 #   GPIO5  = physical pin 29   (GND on pin 30)
@@ -376,9 +374,6 @@ def main():
     pygame.display.set_caption("face")
     pygame.mouse.set_visible(False)
     clock = pygame.time.Clock()
-    # draw onto a canvas in the rotated orientation, then rotate it onto the real screen
-    sw, sh = screen.get_size()
-    canvas = pygame.Surface((sh, sw) if ROTATE in (90, 270) else (sw, sh))
     buttons = setup_gpio()  # keep reference so buttons aren't garbage collected
     sounds = make_sound_files()
 
@@ -442,8 +437,7 @@ def main():
         elif emotion == "happy":
             bob = round(math.sin(now * 8) * 0.6)   # bouncy
 
-        draw(canvas, build_face(emotion, blinking, dx, dy, bob), COLORS[emotion])
-        screen.blit(pygame.transform.rotate(canvas, ROTATE) if ROTATE else canvas, (0, 0))
+        draw(screen, build_face(emotion, blinking, dx, dy, bob), COLORS[emotion])
         pygame.display.flip()
         clock.tick(FPS)
 
