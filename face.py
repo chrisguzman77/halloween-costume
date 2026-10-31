@@ -243,3 +243,212 @@ def synth(notes):
             edge = min(1.0, i / fade, (n - i) / fade)
             s = round(s * env * edge * 7) / 7
             out.append(int(s * vol * 0.8 * 32767))
+    return out
+
+
+def make_sound_files():
+    """Generate sounds/<emotion>.wav next to this script. Returns {emotion: path}."""
+    if not SOUND_ON:
+        return {}
+    folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
+    os.makedirs(folder, exist_ok=True)
+    paths = {}
+    for emo, notes in SOUNDS.items():
+        path = os.path.join(folder, f"{emo}.wav")
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SAMPLE_RATE)
+            samples = synth(notes)
+            w.writeframes(struct.pack(f"<{len(samples)}h", *samples))
+        paths[emo] = path
+    return paths
+
+
+# The audio device is only opened while a sound plays, then closed again.
+# Keeping it open while silent makes some speakers thump.
+audio = {"sound": None, "close_at": 0.0}
+
+
+def play_sound(path):
+    try:
+        if pygame.mixer.get_init():
+            pygame.mixer.stop()
+        else:
+            pygame.mixer.init()
+        snd = pygame.mixer.Sound(path)
+        snd.set_volume(SOUND_VOLUME)
+        snd.play()
+        audio["sound"] = snd
+        audio["close_at"] = time.monotonic() + snd.get_length() + 0.5
+    except pygame.error as e:
+        print(f"Sound failed ({e})")
+
+
+def close_audio_when_done():
+    if pygame.mixer.get_init() and time.monotonic() > audio["close_at"] and not pygame.mixer.get_busy():
+        pygame.mixer.quit()
+        audio["sound"] = None
+
+
+CANVAS_W, CANVAS_H = 40, 24   # logical "LED" grid
+LEFT_EYE_X, RIGHT_EYE_X, EYE_Y = 7, 25, 4
+MOUTH_X, MOUTH_Y = 12, 16
+
+
+def parse(art):
+    return [row for row in art.strip("\n").split("\n")]
+
+
+EYES = {k: parse(v) for k, v in EYES.items()}
+MOUTHS = {k: parse(v) for k, v in MOUTHS.items()}
+
+
+def stamp(grid, sprite, x0, y0, mirror=False):
+    for y, row in enumerate(sprite):
+        if mirror:
+            row = row[::-1]
+        for x, ch in enumerate(row):
+            gx, gy = x0 + x, y0 + y
+            if ch != "." and 0 <= gx < CANVAS_W and 0 <= gy < CANVAS_H:
+                grid[gy][gx] = ch
+
+
+def build_face(emotion, blinking, look_dx, look_dy, bob):
+    grid = [["." for _ in range(CANVAS_W)] for _ in range(CANVAS_H)]
+    eye = EYES["blink"] if blinking else EYES[emotion]
+    stamp(grid, eye, LEFT_EYE_X + look_dx, EYE_Y + look_dy + bob)
+    stamp(grid, eye, RIGHT_EYE_X + look_dx, EYE_Y + look_dy + bob, mirror=True)
+    stamp(grid, MOUTHS[emotion], MOUTH_X, MOUTH_Y + bob)
+    return grid
+
+
+def draw(screen, grid, color):
+    sw, sh = screen.get_size()
+    cell = min(sw / CANVAS_W, sh / CANVAS_H)
+    ox = (sw - cell * CANVAS_W) / 2
+    oy = (sh - cell * CANVAS_H) / 2
+    gap = cell * PIXEL_GAP
+    size = max(1, math.ceil(cell - gap))
+    screen.fill((0, 0, 0))
+    for y, row in enumerate(grid):
+        for x, ch in enumerate(row):
+            if ch == ".":
+                continue
+            c = TEAR if ch == "b" else color
+            screen.fill(c, (int(ox + x * cell), int(oy + y * cell), size, size))
+
+
+# ---------------- input ----------------
+state = {"emotion": None, "until": 0.0, "held": set(), "play": None}
+
+
+def trigger(emotion, sound=False):
+    state["emotion"] = emotion
+    state["until"] = time.monotonic() + HOLD_SECONDS
+    if sound:
+        state["play"] = emotion  # played by the main loop
+
+
+def setup_gpio():
+    try:
+        from gpiozero import Button
+    except ImportError:
+        print("gpiozero not found, keyboard only")
+        return []
+    buttons = []
+    for pin, emo in BUTTONS.items():
+        try:
+            b = Button(pin, pull_up=True, bounce_time=0.03)
+        except Exception as e:  # not on a Pi, or pin busy
+            print(f"GPIO{pin} unavailable ({e}), keyboard only")
+            return buttons
+        b.when_pressed = lambda e=emo: (state["held"].add(e), trigger(e, sound=True))
+        b.when_released = lambda e=emo: (state["held"].discard(e), trigger(e))
+        buttons.append(b)
+    return buttons
+
+
+def main():
+    pygame.display.init()   # not pygame.init(), which would open the audio device right away
+    flags = pygame.FULLSCREEN if FULLSCREEN else 0
+    screen = pygame.display.set_mode((0, 0) if FULLSCREEN else (800, 480), flags)
+    pygame.display.set_caption("face")
+    pygame.mouse.set_visible(False)
+    clock = pygame.time.Clock()
+    # draw onto a canvas in the rotated orientation, then rotate it onto the real screen
+    sw, sh = screen.get_size()
+    canvas = pygame.Surface((sh, sw) if ROTATE in (90, 270) else (sw, sh))
+    buttons = setup_gpio()  # keep reference so buttons aren't garbage collected
+    sounds = make_sound_files()
+
+    next_blink = time.monotonic() + random.uniform(2, 5)
+    blink_end = 0.0
+    look = (0, 0)
+    next_look = time.monotonic() + random.uniform(1.5, 4)
+
+    running = True
+    while running:
+        now = time.monotonic()
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                running = False
+            elif ev.type == pygame.KEYDOWN:
+                if ev.key in (pygame.K_ESCAPE, pygame.K_q):
+                    running = False
+                elif ev.key in KEYS:
+                    state["held"].add(KEYS[ev.key])
+                    trigger(KEYS[ev.key], sound=True)
+            elif ev.type == pygame.KEYUP and ev.key in KEYS:
+                state["held"].discard(KEYS[ev.key])
+                trigger(KEYS[ev.key])
+
+        # play a queued sound, and close the audio device once it's finished
+        if state["play"]:
+            path = sounds.get(state["play"])
+            state["play"] = None
+            if path:
+                play_sound(path)
+        close_audio_when_done()
+
+        # which emotion is showing?
+        if state["emotion"] and (state["emotion"] in state["held"] or now < state["until"]):
+            emotion = state["emotion"]
+        else:
+            emotion = "idle"
+            state["emotion"] = None
+
+        # blinking (idle + a few emotions)
+        if now >= next_blink:
+            blink_end = now + 0.12
+            next_blink = now + random.uniform(2.5, 5.5)
+        blinking = now < blink_end and emotion in ("idle", "sad", "love", "angry")
+
+        # glancing around (idle only)
+        if emotion == "idle":
+            if now >= next_look:
+                look = random.choice([(0, 0), (0, 0), (-2, 0), (2, 0), (-1, -1), (1, -1)])
+                next_look = now + random.uniform(1.0, 3.5)
+            dx, dy = look
+        else:
+            dx, dy = 0, 0
+
+        # bobbing / per-emotion motion
+        bob = round(math.sin(now * 2.0) * 0.6)
+        if emotion == "angry":
+            dx += random.choice((-1, 0, 1))       # shake
+        elif emotion == "shocked":
+            bob = -1                               # jump up
+        elif emotion == "happy":
+            bob = round(math.sin(now * 8) * 0.6)   # bouncy
+
+        draw(canvas, build_face(emotion, blinking, dx, dy, bob), COLORS[emotion])
+        screen.blit(pygame.transform.rotate(canvas, ROTATE) if ROTATE else canvas, (0, 0))
+        pygame.display.flip()
+        clock.tick(FPS)
+
+    pygame.quit()
+
+
+if __name__ == "__main__":
+    main()
